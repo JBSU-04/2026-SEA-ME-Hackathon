@@ -1,0 +1,21 @@
+# Build & Devel
+build/
+devel/
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Logs
+*.log

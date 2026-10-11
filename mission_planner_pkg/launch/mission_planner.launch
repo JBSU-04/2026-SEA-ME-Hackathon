@@ -1,0 +1,37 @@
+<launch>
+  <node pkg="mission_planner_pkg" exec="mission_planner_node" name="mission_planner_node" output="screen">
+
+    <!-- Inputs -->
+    <param name="traffic_light_green_topic" value="/traffic_light_green"/>
+    <param name="traffic_light_red_topic"   value="/traffic_light_red"/>
+    <param name="aruco_flag_topic"          value="/aruco_flag"/>
+    <param name="white_lane_topic"          value="/white_lane_detected"/>
+    <param name="yellow_lane_topic"         value="/yellow_lane_detected"/>
+    <param name="yellow_cross_topic"        value="/yellow_cross_detected"/>
+    <param name="warning_zone_topic"        value="/warning_zone_detected"/>
+
+    <!-- Outputs -->
+    <param name="lane_mode_topic"  value="/mission_lane_mode"/>
+    <param name="speed_mode_topic" value="/mission_speed_mode"/>
+
+    <!-- Behavior -->
+    <param name="planner_hz" type="float" value="20.0"/>
+    <param name="start_stopped" type="bool" value="false"/> <!-- false: drive without waiting for green -->
+    <param name="white_stable_ticks"  type="int" value="2"/>
+    <param name="yellow_stable_ticks" type="int" value="1"/>
+    <param name="force_lane_duration_sec" type="float" value="2.0"/>
+    <param name="aruco_stop_duration_sec" type="float" value="3.0"/>
+    <!-- Prevents WHITE<->YELLOW chattering where both colors are visible.
+         Must be longer than the longest overlap zone at driving speed. -->
+    <param name="mode_switch_cooldown_sec" type="float" value="3.0"/>
+    <param name="yellow_hold_sec" type="float" value="5.0"/>
+    <!-- Ignore extra /yellow_cross_detected rising edges this long after a
+         counted crossing (detector flicker must not scramble RIGHT/LEFT). -->
+    <param name="cross_event_cooldown_sec" type="float" value="5.0"/>
+    <!-- Warning zone (red road in BEV): SLOW while inside. control_pkg scales
+         speed by slow_speed_scale (0.70) when speed mode is SLOW. -->
+    <param name="warning_on_ticks"  type="int" value="3"/>
+    <param name="warning_off_ticks" type="int" value="5"/>
+
+  </node>
+</launch>

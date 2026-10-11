@@ -1,0 +1,878 @@
+#include <rclcpp/rclcpp.hpp>
+#include <control_msgs/msg/control.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/int32.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <memory>
+#include <string>
+
+class ControlNode : public rclcpp::Node {
+public:
+    ControlNode()
+        : Node("auto_control_node"),
+          mission_state_(0),
+          line_offset_(0.0f),
+          line_heading_(0.0f),
+          line_curvature_(0.0f),
+          line_valid_(false),
+          have_line_(false),
+          offset_is_fresh_(false),
+          prev_error_(0.0),
+          has_prev_error_(false),
+          integral_(0.0),
+          filtered_derivative_(0.0),
+          image_center_(320.0),
+          force_count_(0),
+          last_valid_steering_(0.0),
+          last_published_steering_(0.0),
+          has_last_published_steering_(false),
+          filtered_throttle_(0.0f),
+          has_filtered_throttle_(false)
+    {
+        debug_mode_ = declare_parameter<bool>("debug_mode", false);
+        metrics_log_enable_ = declare_parameter<bool>("metrics_log_enable", true);
+        metrics_log_period_ms_ = declare_parameter<int>("metrics_log_period_ms", 500);
+        metrics_log_period_ms_ = std::max(100, metrics_log_period_ms_);
+        int init_state = declare_parameter<int>("initial_state", 0);
+        mission_state_ = init_state;
+
+        stopline_flag_topic_ = declare_parameter<std::string>("stopline_flag_topic", "/stopline_flag");
+        line_offset_topic_ = declare_parameter<std::string>("line_offset_topic", "/line_offset");
+        line_heading_topic_ = declare_parameter<std::string>("line_heading_topic", "/line_heading");
+        line_curvature_topic_ = declare_parameter<std::string>("line_curvature_topic", "/line_curvature");
+        line_valid_topic_ = declare_parameter<std::string>("line_valid_topic", "/line_valid");
+        control_tuning_topic_ = declare_parameter<std::string>("control_tuning_topic", "/control_tuning");
+        debug_metrics_topic_ = declare_parameter<std::string>("debug_metrics_topic", "/control_debug");
+        yellow_detected_topic_ = declare_parameter<std::string>("yellow_detected_topic", "/yellow_detected");
+        green_topic_ = declare_parameter<std::string>("traffic_light_green_topic", "/traffic_light_green");
+        red_topic_ = declare_parameter<std::string>("traffic_light_red_topic", "/traffic_light_red");
+        aruco_topic_ = declare_parameter<std::string>("aruco_flag_topic", "/aruco_flag");
+        mission_state_topic_ = declare_parameter<std::string>("mission_state_topic", "/mission_state");
+        control_topic_ = declare_parameter<std::string>("control_topic", "/control");
+
+        control_hz_ = declare_parameter<double>("control_hz", 20.0);
+        line_timeout_sec_ = declare_parameter<double>("line_timeout_sec", 0.30);
+        line_timeout_sec_ = std::max(0.05, std::min(2.0, line_timeout_sec_));
+        line_invalid_streak_limit_ = declare_parameter<int>("line_invalid_streak_limit", 3);
+        line_invalid_streak_limit_ = std::max(1, line_invalid_streak_limit_);
+
+        p_gain_s1_ = declare_parameter<double>("p_gain_s1", 0.0);
+        d_gain_s1_ = declare_parameter<double>("d_gain_s1", 0.0);
+        heading_gain_s1_ = declare_parameter<double>("heading_gain_s1", 45.0);
+        p_gain_s2_ = declare_parameter<double>("p_gain_s2", 0.0);
+        d_gain_s2_ = declare_parameter<double>("d_gain_s2", 0.0);
+        heading_gain_s2_ = declare_parameter<double>("heading_gain_s2", 35.0);
+        p_gain_s4_ = declare_parameter<double>("p_gain_s4", 0.0);
+        d_gain_s4_ = declare_parameter<double>("d_gain_s4", 0.0);
+        heading_gain_s4_ = declare_parameter<double>("heading_gain_s4", 35.0);
+        p_gain_s6_ = declare_parameter<double>("p_gain_s6", 0.0);
+        d_gain_s6_ = declare_parameter<double>("d_gain_s6", 0.0);
+        heading_gain_s6_ = declare_parameter<double>("heading_gain_s6", 35.0);
+        p_gain_s7_ = declare_parameter<double>("p_gain_s7", 0.0);
+        d_gain_s7_ = declare_parameter<double>("d_gain_s7", 0.0);
+        heading_gain_s7_ = declare_parameter<double>("heading_gain_s7", 30.0);
+        p_gain_s9_ = declare_parameter<double>("p_gain_s9", 0.0);
+        d_gain_s9_ = declare_parameter<double>("d_gain_s9", 0.0);
+        heading_gain_s9_ = declare_parameter<double>("heading_gain_s9", 35.0);
+        max_steering_rad_ = declare_parameter<double>("max_steering_rad", 0.0);
+        image_center_ = declare_parameter<double>("image_center", 320.0);
+        d_filter_alpha_ = declare_parameter<double>("d_filter_alpha", 1.0);
+        d_filter_alpha_ = std::max(0.0, std::min(1.0, d_filter_alpha_));
+        heading_term_limit_px_ = declare_parameter<double>("heading_term_limit_px", 80.0);
+        heading_term_limit_px_ = std::max(0.0, std::min(320.0, heading_term_limit_px_));
+        max_steer_step_per_cycle_ = declare_parameter<double>("max_steer_step_per_cycle", 0.05);
+        max_steer_step_per_cycle_ = std::max(0.0, std::min(1.0, max_steer_step_per_cycle_));
+        throttle_offset_deadband_px_ = declare_parameter<double>("throttle_offset_deadband_px", 20.0);
+        throttle_offset_full_px_ = declare_parameter<double>("throttle_offset_full_px", 120.0);
+        throttle_heading_deadband_rad_ = declare_parameter<double>("throttle_heading_deadband_rad", 0.08);
+        throttle_heading_full_rad_ = declare_parameter<double>("throttle_heading_full_rad", 0.50);
+        throttle_derivative_deadband_px_ = declare_parameter<double>("throttle_derivative_deadband_px", 4.0);
+        throttle_derivative_full_px_ = declare_parameter<double>("throttle_derivative_full_px", 35.0);
+        throttle_curvature_deadband_ = declare_parameter<double>("throttle_curvature_deadband", 0.0015);
+        throttle_curvature_full_ = declare_parameter<double>("throttle_curvature_full", 0.012);
+        throttle_decel_alpha_ = declare_parameter<double>("throttle_decel_alpha", 0.45);
+        throttle_accel_alpha_ = declare_parameter<double>("throttle_accel_alpha", 0.08);
+        throttle_offset_deadband_px_ = std::max(0.0, throttle_offset_deadband_px_);
+        throttle_offset_full_px_ = std::max(throttle_offset_deadband_px_ + 1.0, throttle_offset_full_px_);
+        throttle_heading_deadband_rad_ = std::max(0.0, throttle_heading_deadband_rad_);
+        throttle_heading_full_rad_ = std::max(throttle_heading_deadband_rad_ + 0.01, throttle_heading_full_rad_);
+        throttle_derivative_deadband_px_ = std::max(0.0, throttle_derivative_deadband_px_);
+        throttle_derivative_full_px_ = std::max(throttle_derivative_deadband_px_ + 1.0, throttle_derivative_full_px_);
+        throttle_curvature_deadband_ = std::max(0.0, throttle_curvature_deadband_);
+        throttle_curvature_full_ = std::max(throttle_curvature_deadband_ + 1e-4, throttle_curvature_full_);
+        throttle_decel_alpha_ = std::max(0.0, std::min(1.0, throttle_decel_alpha_));
+        throttle_accel_alpha_ = std::max(0.0, std::min(1.0, throttle_accel_alpha_));
+
+        p_gain_deadband_px_ = declare_parameter<double>("p_gain_deadband_px", 20.0);
+        p_gain_full_px_ = declare_parameter<double>("p_gain_full_px", 120.0);
+        p_gain_max_scale_ = declare_parameter<double>("p_gain_max_scale", 1.50);
+        p_gain_min_scale_ = declare_parameter<double>("p_gain_min_scale", 0.50);
+        d_gain_max_scale_ = declare_parameter<double>("d_gain_max_scale", 1.50);
+        d_gain_min_scale_ = declare_parameter<double>("d_gain_min_scale", 0.50);
+        p_gain_deadband_px_ = std::max(0.0, p_gain_deadband_px_);
+        p_gain_full_px_ = std::max(p_gain_deadband_px_ + 1.0, p_gain_full_px_);
+        p_gain_max_scale_ = std::max(1.0, p_gain_max_scale_);
+        p_gain_min_scale_ = std::max(0.0, std::min(1.0, p_gain_min_scale_));
+        d_gain_max_scale_ = std::max(1.0, d_gain_max_scale_);
+        d_gain_min_scale_ = std::max(0.0, std::min(1.0, d_gain_min_scale_));
+
+        max_speed_s1_ = declare_parameter<double>("max_speed_s1", 0.30);
+        min_speed_s1_ = declare_parameter<double>("min_speed_s1", 0.28);
+        steer_ratio_s1_ = declare_parameter<double>("steering_speed_ratio_s1", 1.0);
+        max_speed_s2_ = declare_parameter<double>("max_speed_s2", 0.30);
+        min_speed_s2_ = declare_parameter<double>("min_speed_s2", 0.28);
+        steer_ratio_s2_ = declare_parameter<double>("steering_speed_ratio_s2", 1.0);
+        max_speed_s4_ = declare_parameter<double>("max_speed_s4", 0.25);
+        min_speed_s4_ = declare_parameter<double>("min_speed_s4", 0.25);
+        steer_ratio_s4_ = declare_parameter<double>("steering_speed_ratio_s4", 1.0);
+        max_speed_s6_ = declare_parameter<double>("max_speed_s6", 0.32);
+        min_speed_s6_ = declare_parameter<double>("min_speed_s6", 0.29);
+        steer_ratio_s6_ = declare_parameter<double>("steering_speed_ratio_s6", 1.0);
+        max_speed_s7_ = declare_parameter<double>("max_speed_s7", 0.25);
+        min_speed_s7_ = declare_parameter<double>("min_speed_s7", 0.23);
+        steer_ratio_s7_ = declare_parameter<double>("steering_speed_ratio_s7", 1.0);
+        max_speed_s9_ = declare_parameter<double>("max_speed_s9", 0.32);
+        min_speed_s9_ = declare_parameter<double>("min_speed_s9", 0.29);
+        steer_ratio_s9_ = declare_parameter<double>("steering_speed_ratio_s9", 1.0);
+
+        force_s3_count_ = declare_parameter<int>("force_s3_count", 20);
+        force_s3_steering_ = declare_parameter<double>("force_s3_steering", 0.35);
+        force_s3_throttle_ = declare_parameter<double>("force_s3_throttle", 0.25);
+        force_s5_count_ = declare_parameter<int>("force_s5_count", 20);
+        force_s5_steering_ = declare_parameter<double>("force_s5_steering", -0.35);
+        force_s5_throttle_ = declare_parameter<double>("force_s5_throttle", 0.25);
+        force_s3_count_ = std::max(1, force_s3_count_);
+        force_s5_count_ = std::max(1, force_s5_count_);
+
+        stopline_sub_ = create_subscription<std_msgs::msg::Bool>(
+            stopline_flag_topic_, 10,
+            [this](const std_msgs::msg::Bool::SharedPtr msg) { stoplineCb(msg); });
+        offset_sub_ = create_subscription<std_msgs::msg::Float32>(
+            line_offset_topic_, 10,
+            [this](const std_msgs::msg::Float32::SharedPtr msg) { offsetCb(msg); });
+        heading_sub_ = create_subscription<std_msgs::msg::Float32>(
+            line_heading_topic_, 10,
+            [this](const std_msgs::msg::Float32::SharedPtr msg) { headingCb(msg); });
+        curvature_sub_ = create_subscription<std_msgs::msg::Float32>(
+            line_curvature_topic_, 10,
+            [this](const std_msgs::msg::Float32::SharedPtr msg) { curvatureCb(msg); });
+        line_valid_sub_ = create_subscription<std_msgs::msg::Bool>(
+            line_valid_topic_, 10,
+            [this](const std_msgs::msg::Bool::SharedPtr msg) { lineValidCb(msg); });
+        control_tuning_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
+            control_tuning_topic_, 10,
+            [this](const std_msgs::msg::Float32MultiArray::SharedPtr msg) { controlTuningCb(msg); });
+        yellow_sub_ = create_subscription<std_msgs::msg::Bool>(
+            yellow_detected_topic_, 10,
+            [this](const std_msgs::msg::Bool::SharedPtr msg) { yellowCb(msg); });
+        green_sub_ = create_subscription<std_msgs::msg::Bool>(
+            green_topic_, 10,
+            [this](const std_msgs::msg::Bool::SharedPtr msg) { greenCb(msg); });
+        red_sub_ = create_subscription<std_msgs::msg::Bool>(
+            red_topic_, 10,
+            [this](const std_msgs::msg::Bool::SharedPtr msg) { redCb(msg); });
+        aruco_sub_ = create_subscription<std_msgs::msg::Bool>(
+            aruco_topic_, 10,
+            [this](const std_msgs::msg::Bool::SharedPtr msg) { arucoCb(msg); });
+
+        mission_pub_ = create_publisher<std_msgs::msg::Int32>(mission_state_topic_, 10);
+        control_pub_ = create_publisher<control_msgs::msg::Control>(control_topic_, 10);
+        debug_metrics_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(debug_metrics_topic_, 10);
+
+        const double timer_hz = std::max(1.0, control_hz_);
+        timer_ = create_wall_timer(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::duration<double>(1.0 / timer_hz)),
+            [this]() { run(); });
+
+        RCLCPP_INFO(get_logger(), "[control_node] Started. Initial state=0, control_hz=%.1f", timer_hz);
+    }
+
+private:
+    struct BoolInput {
+        bool current = false;
+        bool previous = false;
+
+        bool rising() const { return current && !previous; }
+        bool falling() const { return !current && previous; }
+        void updatePrevious() { previous = current; }
+    };
+
+    struct Command {
+        double steering = 0.0;
+        float throttle = 0.0f;
+    };
+
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr stopline_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr offset_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr heading_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr curvature_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr line_valid_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr control_tuning_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr yellow_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr green_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr red_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr aruco_sub_;
+    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr mission_pub_;
+    rclcpp::Publisher<control_msgs::msg::Control>::SharedPtr control_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr debug_metrics_pub_;
+    rclcpp::TimerBase::SharedPtr timer_;
+
+    std::string stopline_flag_topic_, line_offset_topic_, line_heading_topic_, line_curvature_topic_, line_valid_topic_, control_tuning_topic_, debug_metrics_topic_, yellow_detected_topic_;
+    std::string green_topic_, red_topic_, aruco_topic_;
+    std::string mission_state_topic_, control_topic_;
+
+    int mission_state_;
+    float line_offset_;
+    float line_heading_;
+    float line_curvature_;
+    bool line_valid_;
+    bool have_line_;
+    rclcpp::Time last_line_time_;
+    int line_invalid_streak_ = 0;
+    int line_invalid_streak_limit_;
+    bool offset_is_fresh_;
+    double prev_error_;
+    bool has_prev_error_;
+    double integral_;
+    double filtered_derivative_;
+    double d_filter_alpha_;
+    double heading_term_limit_px_;
+    double max_steer_step_per_cycle_;
+    double image_center_;
+    double control_hz_;
+    double line_timeout_sec_;
+    int force_count_;
+    double last_valid_steering_;
+
+    bool debug_mode_;
+    bool metrics_log_enable_;
+    int metrics_log_period_ms_;
+    double last_pid_error_ = 0.0;
+    double last_pid_derivative_ = 0.0;
+    double last_pid_filtered_derivative_ = 0.0;
+    double last_pid_p_term_ = 0.0;
+    double last_pid_d_term_ = 0.0;
+    double last_pid_output_ = 0.0;
+    double last_p_gain_ = 0.0;
+    double last_d_gain_ = 0.0;
+    double last_heading_gain_ = 0.0;
+    double last_raw_heading_term_ = 0.0;
+    double last_heading_term_ = 0.0;
+    double last_effective_error_ = 0.0;
+    bool last_derivative_updated_ = false;
+    double last_published_steering_;
+    bool has_last_published_steering_;
+    double last_steering_delta_ = 0.0;
+    double throttle_offset_deadband_px_;
+    double throttle_offset_full_px_;
+    double throttle_heading_deadband_rad_;
+    double throttle_heading_full_rad_;
+    double throttle_derivative_deadband_px_;
+    double throttle_derivative_full_px_;
+    double throttle_curvature_deadband_;
+    double throttle_curvature_full_;
+    double throttle_decel_alpha_;
+    double throttle_accel_alpha_;
+    double p_gain_deadband_px_;
+    double p_gain_full_px_;
+    double p_gain_max_scale_;
+    double p_gain_min_scale_;
+    double d_gain_max_scale_;
+    double d_gain_min_scale_;
+    float filtered_throttle_;
+    bool has_filtered_throttle_;
+    double last_throttle_offset_risk_ = 0.0;
+    double last_throttle_heading_risk_ = 0.0;
+    double last_throttle_derivative_risk_ = 0.0;
+    double last_throttle_curvature_risk_ = 0.0;
+    double last_throttle_risk_ = 0.0;
+    double last_throttle_target_ = 0.0;
+
+    BoolInput stopline_;
+    BoolInput yellow_;
+    BoolInput green_;
+    BoolInput red_;
+    BoolInput aruco_;
+
+    double p_gain_s1_, d_gain_s1_;
+    double heading_gain_s1_;
+    double p_gain_s2_, d_gain_s2_;
+    double heading_gain_s2_;
+    double p_gain_s4_, d_gain_s4_;
+    double heading_gain_s4_;
+    double p_gain_s6_, d_gain_s6_;
+    double heading_gain_s6_;
+    double p_gain_s7_, d_gain_s7_;
+    double heading_gain_s7_;
+    double p_gain_s9_, d_gain_s9_;
+    double heading_gain_s9_;
+    double max_steering_rad_;
+
+    double max_speed_s1_, min_speed_s1_, steer_ratio_s1_;
+    double max_speed_s2_, min_speed_s2_, steer_ratio_s2_;
+    double max_speed_s4_, min_speed_s4_, steer_ratio_s4_;
+    double max_speed_s6_, min_speed_s6_, steer_ratio_s6_;
+    double max_speed_s7_, min_speed_s7_, steer_ratio_s7_;
+    double max_speed_s9_, min_speed_s9_, steer_ratio_s9_;
+
+    int force_s3_count_;
+    double force_s3_steering_;
+    double force_s3_throttle_;
+    int force_s5_count_;
+    double force_s5_steering_;
+    double force_s5_throttle_;
+
+    void stoplineCb(const std_msgs::msg::Bool::SharedPtr msg) { stopline_.current = msg->data; }
+    void yellowCb(const std_msgs::msg::Bool::SharedPtr msg) { yellow_.current = msg->data; }
+    void greenCb(const std_msgs::msg::Bool::SharedPtr msg) { green_.current = msg->data; }
+    void redCb(const std_msgs::msg::Bool::SharedPtr msg) { red_.current = msg->data; }
+    void arucoCb(const std_msgs::msg::Bool::SharedPtr msg) { aruco_.current = msg->data; }
+    void offsetCb(const std_msgs::msg::Float32::SharedPtr msg) {
+        line_offset_ = msg->data;
+        offset_is_fresh_ = true;
+        have_line_ = true;
+        last_line_time_ = now();
+    }
+    void headingCb(const std_msgs::msg::Float32::SharedPtr msg) {
+        line_heading_ = msg->data;
+    }
+    void curvatureCb(const std_msgs::msg::Float32::SharedPtr msg) {
+        line_curvature_ = msg->data;
+    }
+    void lineValidCb(const std_msgs::msg::Bool::SharedPtr msg) {
+        if (msg->data) {
+            line_invalid_streak_ = 0;
+            line_valid_ = true;
+            have_line_ = true;
+            last_line_time_ = now();
+        } else if (++line_invalid_streak_ >= line_invalid_streak_limit_) {
+            // Only drop to invalid after several consecutive bad frames, so a single
+            // dropped/noisy detection doesn't hard-zero the throttle on an otherwise clean straight.
+            line_valid_ = false;
+        }
+    }
+
+    void controlTuningCb(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+        // [0] state selector: 0 means all lane-follow states, otherwise one of 1/2/4/6/7/9.
+        // [1] P gain, [2] D gain, [3] heading gain, [4] D filter alpha,
+        // [5] max steering rad, [6] max speed, [7] min speed, [8] throttle risk scale,
+        // [9] heading term clamp in px, [10] max steering step per control cycle,
+        // [11] p gain max scale, [12] p gain deadband px, [13] p gain full px,
+        // [14] throttle decel alpha, [15] throttle accel alpha, [16] p gain min scale,
+        // [17] d gain max scale, [18] d gain min scale.
+        if (msg->data.size() < 4) return;
+
+        const int state = static_cast<int>(std::lround(msg->data[0]));
+        const double p = std::max(0.0, std::min(10.0, static_cast<double>(msg->data[1])));
+        const double d = std::max(0.0, std::min(10.0, static_cast<double>(msg->data[2])));
+        const double h = std::max(-300.0, std::min(300.0, static_cast<double>(msg->data[3])));
+        if (msg->data.size() >= 5) {
+            d_filter_alpha_ = std::max(0.0, std::min(1.0, static_cast<double>(msg->data[4])));
+        }
+        if (msg->data.size() >= 6) {
+            max_steering_rad_ = std::max(0.0, std::min(1.0, static_cast<double>(msg->data[5])));
+        }
+        if (msg->data.size() >= 10) {
+            heading_term_limit_px_ = std::max(0.0, std::min(320.0, static_cast<double>(msg->data[9])));
+        }
+        if (msg->data.size() >= 11) {
+            max_steer_step_per_cycle_ = std::max(0.0, std::min(1.0, static_cast<double>(msg->data[10])));
+        }
+
+        if (msg->data.size() >= 12) {
+            p_gain_max_scale_ = std::max(1.0, std::min(5.0, static_cast<double>(msg->data[11])));
+        }
+        if (msg->data.size() >= 13) {
+            p_gain_deadband_px_ = std::max(0.0, static_cast<double>(msg->data[12]));
+        }
+        if (msg->data.size() >= 14) {
+            p_gain_full_px_ = std::max(p_gain_deadband_px_ + 1.0, static_cast<double>(msg->data[13]));
+        }
+        if (msg->data.size() >= 15) {
+            throttle_decel_alpha_ = std::max(0.0, std::min(1.0, static_cast<double>(msg->data[14])));
+        }
+        if (msg->data.size() >= 16) {
+            throttle_accel_alpha_ = std::max(0.0, std::min(1.0, static_cast<double>(msg->data[15])));
+        }
+        if (msg->data.size() >= 17) {
+            p_gain_min_scale_ = std::max(0.0, std::min(1.0, static_cast<double>(msg->data[16])));
+        }
+        if (msg->data.size() >= 18) {
+            d_gain_max_scale_ = std::max(1.0, std::min(5.0, static_cast<double>(msg->data[17])));
+        }
+        if (msg->data.size() >= 19) {
+            d_gain_min_scale_ = std::max(0.0, std::min(1.0, static_cast<double>(msg->data[18])));
+        }
+
+        auto apply_gains = [&](double& pg, double& dg, double& hg) {
+            pg = p;
+            dg = d;
+            hg = h;
+        };
+        auto apply_speed = [&](double& max_speed, double& min_speed, double& steer_ratio) {
+            if (msg->data.size() >= 7) max_speed = std::max(0.0, std::min(1.0, static_cast<double>(msg->data[6])));
+            if (msg->data.size() >= 8) min_speed = std::max(0.0, std::min(max_speed, static_cast<double>(msg->data[7])));
+            if (msg->data.size() >= 9) steer_ratio = std::max(0.0, std::min(2.0, static_cast<double>(msg->data[8])));
+        };
+        auto apply_state = [&](int s) {
+            switch (s) {
+            case 1:
+                apply_gains(p_gain_s1_, d_gain_s1_, heading_gain_s1_);
+                apply_speed(max_speed_s1_, min_speed_s1_, steer_ratio_s1_);
+                break;
+            case 2:
+                apply_gains(p_gain_s2_, d_gain_s2_, heading_gain_s2_);
+                apply_speed(max_speed_s2_, min_speed_s2_, steer_ratio_s2_);
+                break;
+            case 4:
+                apply_gains(p_gain_s4_, d_gain_s4_, heading_gain_s4_);
+                apply_speed(max_speed_s4_, min_speed_s4_, steer_ratio_s4_);
+                break;
+            case 6:
+                apply_gains(p_gain_s6_, d_gain_s6_, heading_gain_s6_);
+                apply_speed(max_speed_s6_, min_speed_s6_, steer_ratio_s6_);
+                break;
+            case 7:
+                apply_gains(p_gain_s7_, d_gain_s7_, heading_gain_s7_);
+                apply_speed(max_speed_s7_, min_speed_s7_, steer_ratio_s7_);
+                break;
+            case 9:
+                apply_gains(p_gain_s9_, d_gain_s9_, heading_gain_s9_);
+                apply_speed(max_speed_s9_, min_speed_s9_, steer_ratio_s9_);
+                break;
+            default:
+                break;
+            }
+        };
+
+        if (state == 0) {
+            for (int s : {1, 2, 4, 6, 7, 9}) apply_state(s);
+        } else {
+            apply_state(state);
+        }
+
+        RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "[ctrl_tuning] state=%d p=%.3f d=%.3f h=%.1f d_alpha=%.2f max_steer=%.3f h_limit=%.1f steer_step=%.3f p_max_scale=%.2f p_min_scale=%.2f d_max_scale=%.2f d_min_scale=%.2f p_dead=%.1f p_full=%.1f decel_a=%.2f accel_a=%.2f",
+            state, p, d, h, d_filter_alpha_, max_steering_rad_,
+            heading_term_limit_px_, max_steer_step_per_cycle_,
+            p_gain_max_scale_, p_gain_min_scale_, d_gain_max_scale_, d_gain_min_scale_,
+            p_gain_deadband_px_, p_gain_full_px_,
+            throttle_decel_alpha_, throttle_accel_alpha_);
+    }
+
+    void resetPid() {
+        integral_ = 0.0;
+        prev_error_ = 0.0;
+        has_prev_error_ = false;
+        filtered_derivative_ = 0.0;
+        offset_is_fresh_ = false;
+        last_pid_error_ = 0.0;
+        last_pid_derivative_ = 0.0;
+        last_pid_filtered_derivative_ = 0.0;
+        last_pid_p_term_ = 0.0;
+        last_pid_d_term_ = 0.0;
+        last_pid_output_ = 0.0;
+        last_raw_heading_term_ = 0.0;
+        last_heading_term_ = 0.0;
+        last_effective_error_ = 0.0;
+        last_derivative_updated_ = false;
+        last_throttle_offset_risk_ = 0.0;
+        last_throttle_heading_risk_ = 0.0;
+        last_throttle_derivative_risk_ = 0.0;
+        last_throttle_curvature_risk_ = 0.0;
+        last_throttle_risk_ = 0.0;
+        last_throttle_target_ = 0.0;
+    }
+
+    void changeState(int next_state, const std::string& reason) {
+        if (mission_state_ == next_state) return;
+
+        const int prev_state = mission_state_;
+        mission_state_ = next_state;
+        force_count_ = 0;
+        resetPid();
+
+        RCLCPP_WARN(get_logger(), "[control_node] state %d -> %d (%s)",
+                    prev_state, mission_state_, reason.c_str());
+    }
+
+    double pidControl(double error, double kp, double ki, double kd) {
+        if (ki != 0.0) integral_ += error;
+
+        double derivative = 0.0;
+        bool derivative_updated = false;
+        if (offset_is_fresh_) {
+            if (has_prev_error_) {
+                derivative = error - prev_error_;
+                derivative_updated = true;
+            }
+            prev_error_ = error;
+            has_prev_error_ = true;
+            offset_is_fresh_ = false;
+        }
+
+        filtered_derivative_ += d_filter_alpha_ * (derivative - filtered_derivative_);
+        const double output = kp * error + ki * integral_ + kd * filtered_derivative_;
+        last_pid_error_ = error;
+        last_pid_derivative_ = derivative;
+        last_pid_filtered_derivative_ = filtered_derivative_;
+        last_pid_p_term_ = kp * error;
+        last_pid_d_term_ = kd * filtered_derivative_;
+        last_pid_output_ = output;
+        last_p_gain_ = kp;
+        last_d_gain_ = kd;
+        last_derivative_updated_ = derivative_updated;
+        return output;
+    }
+
+    // Two-segment gain schedule shared by P and D: error 0 -> p_gain_deadband_px_ ramps
+    // the scale from min_scale up to 1.0 (gentler near dead-center, less prone to
+    // micro-jitter); error p_gain_deadband_px_ -> p_gain_full_px_ ramps from 1.0 up to
+    // max_scale (boost for large errors), holding at max_scale beyond that. P and D share
+    // the same deadband/full window (it's about how far off-center the car is, not which
+    // gain is being scaled) but each has its own independent min/max scale.
+    double dynamicGainScale(double effective_error, double min_scale, double max_scale) const {
+        const double mag = std::fabs(effective_error);
+        if (mag <= p_gain_deadband_px_) {
+            if (p_gain_deadband_px_ <= 1e-6) return 1.0;
+            const double t = mag / p_gain_deadband_px_;
+            return min_scale + t * (1.0 - min_scale);
+        }
+        const double boost_factor = normalizedOverDeadband(effective_error, p_gain_deadband_px_, p_gain_full_px_);
+        return 1.0 + boost_factor * (max_scale - 1.0);
+    }
+
+    double calcSteering(double offset, double heading, double p_gain, double d_gain, double heading_gain) {
+        const double raw_heading_term = heading_gain * heading;
+        const double heading_term = std::max(-heading_term_limit_px_,
+                                             std::min(heading_term_limit_px_, raw_heading_term));
+        const double effective_error = offset + heading_term;
+
+        const double dynamic_p_gain = p_gain * dynamicGainScale(effective_error, p_gain_min_scale_, p_gain_max_scale_);
+        const double dynamic_d_gain = d_gain * dynamicGainScale(effective_error, d_gain_min_scale_, d_gain_max_scale_);
+
+        last_heading_gain_ = heading_gain;
+        last_raw_heading_term_ = raw_heading_term;
+        last_heading_term_ = heading_term;
+        last_effective_error_ = effective_error;
+        const double pid_out = pidControl(effective_error, dynamic_p_gain, 0.0, dynamic_d_gain);
+        const double steering = (pid_out / image_center_) * max_steering_rad_;
+        return std::max(-max_steering_rad_, std::min(max_steering_rad_, steering));
+    }
+
+    double normalizedOverDeadband(double value, double deadband, double full_scale) const {
+        const double mag = std::fabs(value);
+        if (mag <= deadband) return 0.0;
+        const double span = std::max(1e-6, full_scale - deadband);
+        return std::max(0.0, std::min(1.0, (mag - deadband) / span));
+    }
+
+    float calcThrottle(double max_speed, double min_speed, double risk_scale) {
+        const float max_spd = static_cast<float>(max_speed);
+        const float min_spd = static_cast<float>(min_speed);
+        if (max_spd <= min_spd) {
+            filtered_throttle_ = min_spd;
+            has_filtered_throttle_ = true;
+            last_throttle_offset_risk_ = 0.0;
+            last_throttle_heading_risk_ = 0.0;
+            last_throttle_derivative_risk_ = 0.0;
+            last_throttle_curvature_risk_ = 0.0;
+            last_throttle_risk_ = 0.0;
+            last_throttle_target_ = min_spd;
+            return min_spd;
+        }
+
+        const double offset_risk = normalizedOverDeadband(
+            static_cast<double>(line_offset_), throttle_offset_deadband_px_, throttle_offset_full_px_);
+        const double heading_risk = normalizedOverDeadband(
+            static_cast<double>(line_heading_), throttle_heading_deadband_rad_, throttle_heading_full_rad_);
+        const double derivative_risk = normalizedOverDeadband(
+            last_pid_filtered_derivative_, throttle_derivative_deadband_px_, throttle_derivative_full_px_);
+        const double curvature_risk = normalizedOverDeadband(
+            static_cast<double>(line_curvature_), throttle_curvature_deadband_, throttle_curvature_full_);
+
+        // Speed reduction is driven purely by how far off-center the car is (offset_risk, 0~1).
+        // heading/derivative/curvature risk are still computed above for tuner visibility only.
+        const double scaled_risk = std::max(0.0, std::min(1.0, offset_risk * std::max(0.0, risk_scale)));
+        const float target = std::max(
+            min_spd,
+            std::min(max_spd, max_spd - static_cast<float>(scaled_risk) * (max_spd - min_spd)));
+
+        if (!has_filtered_throttle_) {
+            filtered_throttle_ = target;
+            has_filtered_throttle_ = true;
+        } else {
+            const double alpha = target < filtered_throttle_ ? throttle_decel_alpha_ : throttle_accel_alpha_;
+            filtered_throttle_ += static_cast<float>(alpha * (target - filtered_throttle_));
+        }
+        filtered_throttle_ = std::max(min_spd, std::min(max_spd, filtered_throttle_));
+
+        last_throttle_offset_risk_ = offset_risk;
+        last_throttle_heading_risk_ = heading_risk;
+        last_throttle_derivative_risk_ = derivative_risk;
+        last_throttle_curvature_risk_ = curvature_risk;
+        last_throttle_risk_ = scaled_risk;
+        last_throttle_target_ = target;
+        return filtered_throttle_;
+    }
+
+    Command laneControl(double max_speed, double min_speed, double steer_ratio,
+                        double p_gain, double d_gain, double heading_gain,
+                        double steering_scale = -1.0) {
+        Command cmd;
+        cmd.steering = calcSteering(static_cast<double>(line_offset_),
+                                    static_cast<double>(line_heading_),
+                                    p_gain, d_gain, heading_gain) * steering_scale;
+        cmd.steering = std::max(-max_steering_rad_, std::min(max_steering_rad_, cmd.steering));
+        cmd.throttle = calcThrottle(max_speed, min_speed, steer_ratio);
+        return cmd;
+    }
+
+    Command stopControl() {
+        return Command{};
+    }
+
+    bool lineIsUsable() {
+        if (!have_line_ || !line_valid_) return false;
+        if (last_line_time_.nanoseconds() == 0) return false;
+        return (now() - last_line_time_).seconds() <= line_timeout_sec_;
+    }
+
+    Command forceControl(int next_state, int force_count_limit, double steering,
+                         double throttle, const std::string& reason) {
+        Command cmd;
+        cmd.steering = steering;
+        cmd.throttle = static_cast<float>(throttle);
+
+        ++force_count_;
+        if (force_count_ >= force_count_limit) {
+            changeState(next_state, reason);
+        }
+
+        return cmd;
+    }
+
+    Command sanitizeCommand(Command cmd) {
+        const bool steering_ok = std::isfinite(cmd.steering);
+        const bool throttle_ok = std::isfinite(static_cast<double>(cmd.throttle));
+
+        if (!steering_ok || !throttle_ok) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "[control_safety] invalid command steer=%.4f throttle=%.3f -> steer=%.4f throttle=0",
+                cmd.steering, cmd.throttle, last_valid_steering_);
+            cmd.steering = last_valid_steering_;
+            cmd.throttle = 0.0f;
+            return cmd;
+        }
+
+        cmd.steering = std::max(-max_steering_rad_, std::min(max_steering_rad_, cmd.steering));
+        cmd.throttle = std::max(0.0f, std::min(1.0f, cmd.throttle));
+        if (cmd.throttle <= 0.0f) {
+            filtered_throttle_ = 0.0f;
+            has_filtered_throttle_ = true;
+        }
+        last_valid_steering_ = cmd.steering;
+        return cmd;
+    }
+
+    Command applySteeringSlewLimit(Command cmd) {
+        if (max_steer_step_per_cycle_ <= 0.0) {
+            last_valid_steering_ = cmd.steering;
+            return cmd;
+        }
+
+        if (!has_last_published_steering_) {
+            last_valid_steering_ = cmd.steering;
+            return cmd;
+        }
+
+        const double delta = cmd.steering - last_published_steering_;
+        const double limited_delta = std::max(-max_steer_step_per_cycle_,
+                                              std::min(max_steer_step_per_cycle_, delta));
+        cmd.steering = last_published_steering_ + limited_delta;
+        last_valid_steering_ = cmd.steering;
+        return cmd;
+    }
+
+    void updateBoolHistory() {
+        stopline_.updatePrevious();
+        yellow_.updatePrevious();
+        green_.updatePrevious();
+        red_.updatePrevious();
+        aruco_.updatePrevious();
+    }
+
+    void publishStateAndCommand(const Command& cmd) {
+        std_msgs::msg::Int32 state_msg;
+        state_msg.data = mission_state_;
+        mission_pub_->publish(state_msg);
+
+        control_msgs::msg::Control control_msg;
+        control_msg.header.stamp = now();
+        control_msg.steering = static_cast<float>(cmd.steering);
+        control_msg.throttle = cmd.throttle;
+        control_pub_->publish(control_msg);
+
+        if (has_last_published_steering_) {
+            last_steering_delta_ = cmd.steering - last_published_steering_;
+        } else {
+            last_steering_delta_ = 0.0;
+            has_last_published_steering_ = true;
+        }
+        last_published_steering_ = cmd.steering;
+    }
+
+    void logControlMetrics(const Command& cmd) {
+        publishDebugMetrics(cmd);
+        if (!metrics_log_enable_) return;
+
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), metrics_log_period_ms_,
+            "[ctrl_dbg] state=%d offset=%.2f heading=%.3f h_gain=%.1f h_raw=%.2f h_term=%.2f h_lim=%.1f eff_err=%.2f "
+            "err=%.2f kp=%.3f kd=%.3f p=%.2f d_raw=%.2f d_filt=%.2f d_term=%.2f "
+            "pid=%.2f steer=%.4f steer_delta=%.4f throttle=%.3f thr_target=%.3f thr_risk=%.2f "
+            "risk_o=%.2f risk_h=%.2f risk_d=%.2f risk_c=%.2f fresh_d=%d line_ok=%d img_center=%.1f max_steer=%.3f steer_step=%.3f",
+            mission_state_, line_offset_, line_heading_, last_heading_gain_, last_raw_heading_term_,
+            last_heading_term_, heading_term_limit_px_, last_effective_error_,
+            last_pid_error_, last_p_gain_, last_d_gain_,
+            last_pid_p_term_, last_pid_derivative_, last_pid_filtered_derivative_,
+            last_pid_d_term_, last_pid_output_, cmd.steering, last_steering_delta_,
+            cmd.throttle, last_throttle_target_, last_throttle_risk_,
+            last_throttle_offset_risk_, last_throttle_heading_risk_, last_throttle_derivative_risk_,
+            last_throttle_curvature_risk_,
+            last_derivative_updated_ ? 1 : 0, lineIsUsable() ? 1 : 0, image_center_,
+            max_steering_rad_, max_steer_step_per_cycle_);
+    }
+
+    void publishDebugMetrics(const Command& cmd) {
+        if (!debug_metrics_pub_) return;
+
+        std_msgs::msg::Float32MultiArray msg;
+        msg.data = {
+            static_cast<float>(mission_state_),
+            line_offset_,
+            line_heading_,
+            static_cast<float>(last_heading_gain_),
+            static_cast<float>(last_heading_term_),
+            static_cast<float>(last_effective_error_),
+            static_cast<float>(last_pid_error_),
+            static_cast<float>(last_p_gain_),
+            static_cast<float>(last_d_gain_),
+            static_cast<float>(last_pid_p_term_),
+            static_cast<float>(last_pid_derivative_),
+            static_cast<float>(last_pid_filtered_derivative_),
+            static_cast<float>(last_pid_d_term_),
+            static_cast<float>(last_pid_output_),
+            static_cast<float>(cmd.steering),
+            static_cast<float>(last_steering_delta_),
+            cmd.throttle,
+            last_derivative_updated_ ? 1.0f : 0.0f,
+            static_cast<float>(image_center_),
+            static_cast<float>(max_steering_rad_),
+            static_cast<float>(last_raw_heading_term_),
+            static_cast<float>(heading_term_limit_px_),
+            static_cast<float>(max_steer_step_per_cycle_),
+            lineIsUsable() ? 1.0f : 0.0f,
+            static_cast<float>(last_throttle_target_),
+            static_cast<float>(last_throttle_risk_),
+            static_cast<float>(last_throttle_offset_risk_),
+            static_cast<float>(last_throttle_heading_risk_),
+            static_cast<float>(last_throttle_derivative_risk_),
+            static_cast<float>(last_throttle_curvature_risk_),
+            line_curvature_,
+        };
+        debug_metrics_pub_->publish(msg);
+    }
+
+    void run() {
+        Command cmd;
+        const bool stopline_edge = stopline_.rising();
+        const bool yellow_edge = yellow_.rising();
+        const bool green_edge = green_.rising();
+        const bool red_edge = red_.rising();
+        const bool aruco_edge = aruco_.rising();
+        const bool aruco_falling = aruco_.falling();
+        const bool line_ok = lineIsUsable();
+
+        switch (mission_state_) {
+        case 0:
+            cmd = stopControl();
+            if (green_edge) changeState(1, "green light");
+            break;
+        case 1:
+            cmd = line_ok ? laneControl(max_speed_s1_, min_speed_s1_, steer_ratio_s1_, p_gain_s1_, d_gain_s1_, heading_gain_s1_)
+                          : stopControl();
+            if (yellow_edge) changeState(2, "yellow lane detected");
+            break;
+        case 2:
+            cmd = line_ok ? laneControl(max_speed_s2_, min_speed_s2_, steer_ratio_s2_, p_gain_s2_, d_gain_s2_, heading_gain_s2_)
+                          : stopControl();
+            if (stopline_edge) changeState(3, "stopline");
+            break;
+        case 3:
+            cmd = forceControl(4, force_s3_count_, force_s3_steering_,
+                               force_s3_throttle_, "intersection entry force done");
+            break;
+        case 4:
+            cmd = line_ok ? laneControl(max_speed_s4_, min_speed_s4_, steer_ratio_s4_, p_gain_s4_, d_gain_s4_, heading_gain_s4_)
+                          : stopControl();
+            if (stopline_edge) changeState(5, "stopline");
+            break;
+        case 5:
+            cmd = forceControl(6, force_s5_count_, force_s5_steering_,
+                               force_s5_throttle_, "intersection exit force done");
+            break;
+        case 6:
+            cmd = line_ok ? laneControl(max_speed_s6_, min_speed_s6_, steer_ratio_s6_, p_gain_s6_, d_gain_s6_, heading_gain_s6_)
+                          : stopControl();
+            if (stopline_edge) changeState(7, "stopline");
+            break;
+        case 7:
+            cmd = line_ok ? laneControl(max_speed_s7_, min_speed_s7_, steer_ratio_s7_, p_gain_s7_, d_gain_s7_, heading_gain_s7_)
+                          : stopControl();
+            if (aruco_edge) changeState(8, "aruco");
+            break;
+        case 8:
+            cmd = stopControl();
+            if (aruco_falling) changeState(9, "aruco lost");
+            break;
+        case 9:
+            cmd = line_ok ? laneControl(max_speed_s9_, min_speed_s9_, steer_ratio_s9_, p_gain_s9_, d_gain_s9_, heading_gain_s9_)
+                          : stopControl();
+            if (red_edge) changeState(10, "red light");
+            break;
+        case 10:
+        default:
+            cmd = stopControl();
+            break;
+        }
+
+        cmd = sanitizeCommand(cmd);
+        cmd = applySteeringSlewLimit(cmd);
+        publishStateAndCommand(cmd);
+        logControlMetrics(cmd);
+        updateBoolHistory();
+
+        if (debug_mode_) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 200,
+                "[control_node] state=%d steer=%.4f throttle=%.3f offset=%.2f "
+                "edge(stop=%d yellow=%d green=%d red=%d aruco=%d aruco_fall=%d)",
+                mission_state_, cmd.steering, cmd.throttle, line_offset_,
+                stopline_edge, yellow_edge, green_edge, red_edge, aruco_edge, aruco_falling);
+        }
+    }
+};
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<ControlNode>());
+    rclcpp::shutdown();
+    return 0;
+}
